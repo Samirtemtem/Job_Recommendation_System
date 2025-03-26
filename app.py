@@ -736,6 +736,228 @@ def debug_skill_analysis():
         return html
     except Exception as e:
         return f"Error analyzing skills: {str(e)}"
+@app.route('/debug/matching/<jobid>', methods=['GET'])
+def debug_candidate_ranking_for_job(jobid):
+    """Debug route to display detailed candidate ranking for a specific job ID"""
+    try:
+        # Normalize job ID
+        normalized_job_id = normalize_id(jobid)
+        logging.debug(f"Debug request for job ID: {normalized_job_id}")
+
+        # Find the job index in the jobposts DataFrame
+        job_idx = None
+        job_data = None
+        for idx, row in jobposts.iterrows():
+            if str(row['JobID']) == normalized_job_id:
+                job_idx = idx
+                job_data = row
+                break
+        
+        if job_idx is None:
+            logging.error(f"Job ID {normalized_job_id} not found in jobposts")
+            return f"Job ID {normalized_job_id} not found", 404
+
+        # Get similarity scores for this job against all candidates
+        similarity_scores = similarity_matrix[job_idx, :]
+        
+        # Get all candidates with non-zero similarity for detailed inspection
+        candidate_indices = np.where(similarity_scores > 0)[0]
+        ranked_candidates = []
+        job_id_str = str(job_data['JobID'])
+        
+        for candidate_idx in candidate_indices:
+            candidate = candidates.iloc[candidate_idx]
+            candidate_id_str = str(candidate['CandidateID'])
+            similarity_score = float(similarity_scores[candidate_idx])
+            
+            # Get detailed matching information if available
+            match_detail = {}
+            if (job_id_str in detailed_matching_info and 
+                candidate_id_str in detailed_matching_info[job_id_str]):
+                match_detail = detailed_matching_info[job_id_str][candidate_id_str]
+            
+            # Construct candidate data with extra debug info
+            candidate_data = {
+                'candidate_id': candidate_id_str,
+                'name': f"{candidate.get('firstName', '')} {candidate.get('lastName', '')}".strip() 
+                        if 'firstName' in candidate else candidate_id_str,
+                'similarity': similarity_score,
+                'skill_score': float(match_detail.get('skill_similarity', similarity_score * (1/3))),
+                'experience_score': float(match_detail.get('experience_similarity', similarity_score * (1/3))),
+                'education_score': float(match_detail.get('education_similarity', similarity_score * (1/3))),
+                'exact_skill_matches': match_detail.get('exact_skill_matches', []),
+                'semantic_skill_matches': match_detail.get('semantic_skill_matches', []),
+                'experience_matches': match_detail.get('experience_matching_words', []),
+                'education_matches': match_detail.get('education_matching_words', []),
+                'semantic_education_matches': match_detail.get('semantic_education_matches', []),
+                'semantic_experience_matches': match_detail.get('semantic_experience_matches', []),
+                'candidate_skills': candidate['Skills'] if isinstance(candidate['Skills'], list) else [],
+                'candidate_experience': candidate.get('experience_details', []),
+                'candidate_education': candidate.get('Education', [])
+            }
+            ranked_candidates.append(candidate_data)
+        
+        # Sort candidates by similarity score (descending)
+        ranked_candidates.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # Limit to top 10 for display (configurable via query param)
+        display_limit = int(request.args.get('limit', 10))
+        ranked_candidates = ranked_candidates[:display_limit]
+        
+        # Prepare job details for display
+        job_skills = job_data['Skills'] if isinstance(job_data['Skills'], list) else []
+        job_description = job_data.get('JobDescription', 'No description available')
+        
+        # Generate HTML for debug output
+        candidates_html = ""
+        for candidate in ranked_candidates:
+            skills_html = ""
+            for skill in job_skills:
+                if skill in candidate['exact_skill_matches']:
+                    skills_html += f'<span class="skill-tag skill-match">{skill} ✓</span>'
+                elif any(job_skill == skill for job_skill, _ in candidate['semantic_skill_matches']):
+                    skills_html += f'<span class="skill-tag skill-partial">{skill} ≈</span>'
+                else:
+                    skills_html += f'<span class="skill-tag skill-nomatch">{skill} ✗</span>'
+            
+            exp_matches = ", ".join([word[0] for word in candidate['experience_matches'][:10]]) or "None"
+            edu_matches = ", ".join([word[0] for word in candidate['education_matches'][:10]]) or "None"
+            
+            candidates_html += f"""
+            <div class="card mb-3">
+                <div class="card-header">
+                    <strong>{candidate['name']} (ID: {candidate['candidate_id']})</strong>
+                    <span class="similarity-badge">{candidate['similarity']*100:.1f}% Match</span>
+                </div>
+                <div class="card-body">
+                    <p><strong>Total Similarity:</strong> {candidate['similarity']:.3f}</p>
+                    <p><strong>Skill Score:</strong> {candidate['skill_score']:.3f} (33.3%)</p>
+                    <p><strong>Experience Score:</strong> {candidate['experience_score']:.3f} (33.3%)</p>
+                    <p><strong>Education Score:</strong> {candidate['education_score']:.3f} (33.3%)</p>
+                    <h5>Job Skills vs. Candidate Skills:</h5>
+                    <div>{skills_html}</div>
+                    <h5>Candidate Skills:</h5>
+                    <p>{', '.join(candidate['candidate_skills']) or 'None'}</p>
+                    <h5>Experience Matches:</h5>
+                    <p>{exp_matches}</p>
+                    <h5>Education Matches:</h5>
+                    <p>{edu_matches}</p>
+                    <h5>Semantic Matches:</h5>
+                    <p>Skills: {', '.join([f'{js} ≈ {cs}' for js, cs in candidate['semantic_skill_matches']]) or 'None'}</p>
+                    <p>Experience: {', '.join([f'{je} ≈ {ce}' for je, ce in candidate['semantic_experience_matches']]) or 'None'}</p>
+                    <p>Education: {', '.join([f'{je} ≈ {ce}' for je, ce in candidate['semantic_education_matches']]) or 'None'}</p>
+                </div>
+            </div>
+            """
+        
+        # Full HTML response
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Debug Matching - Job ID: {normalized_job_id}</title>
+            <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+            <style>
+                body {{ padding: 20px; }}
+                h1, h2 {{ margin-bottom: 20px; }}
+                .container {{ max-width: 100%; }}
+                .similarity-badge {{
+                    background-color: #3498db;
+                    color: white;
+                    padding: 5px 10px;
+                    border-radius: 15px;
+                    font-size: 14px;
+                    float: right;
+                }}
+                .skill-tag {{
+                    padding: 5px 10px;
+                    border-radius: 4px;
+                    margin-right: 5px;
+                    display: inline-block;
+                }}
+                .skill-match {{ background-color: #d4efdf; color: #27ae60; }}
+                .skill-partial {{ background-color: #fdebd0; color: #e67e22; }}
+                .skill-nomatch {{ background-color: #f2f4f6; color: #95a5a6; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Debug Matching for Job ID: {normalized_job_id}</h1>
+                <div class="d-flex mb-3">
+                    <a href="/" class="btn btn-primary mr-2">Back to Home</a>
+                    <a href="/debug/jobposts" class="btn btn-secondary mr-2">View Job Posts</a>
+                    <a href="/debug/candidates" class="btn btn-secondary">View Candidates</a>
+                </div>
+                
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h2>Job Details</h2>
+                    </div>
+                    <div class="card-body">
+                        <p><strong>Title:</strong> {job_data.get('JobTitle', 'Unknown')}</p>
+                        <p><strong>Skills:</strong> {', '.join(job_skills) or 'None'}</p>
+                        <p><strong>Description:</strong> {job_description[:200]}{'...' if len(job_description) > 200 else ''}</p>
+                    </div>
+                </div>
+                
+                <h2>Ranked Candidates (Top {len(ranked_candidates)})</h2>
+                <div class="alert alert-info">
+                    <p><strong>Note:</strong> Showing up to {display_limit} candidates with non-zero similarity scores.</p>
+                </div>
+                {candidates_html}
+            </div>
+        </body>
+        </html>
+        """
+        return html
+    
+    except Exception as e:
+        logging.error(f"Error in debug matching for job ID {jobid}: {str(e)}")
+        return f"Error: {str(e)}", 500
+    
+@app.route('/debug/jobs', methods=['GET', 'POST'])
+def debug_jobs():
+    """Debug page to input a JobID and redirect to matching details"""
+    if request.method == 'POST':
+        jobid = request.form.get('jobid')
+        if jobid:
+            return redirect(url_for('debug_candidate_ranking_for_job', jobid=jobid))
+        else:
+            return "Please enter a valid JobID", 400
+    
+    # Render the form for GET requests
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Debug Job Matching</title>
+        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+        <style>
+            body { padding: 20px; }
+            .container { max-width: 800px; }
+            .form-group { margin-bottom: 20px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Debug Job Matching</h1>
+            <p>Enter a JobID to view detailed candidate matching information.</p>
+            <form method="POST" action="/debug/jobs">
+                <div class="form-group">
+                    <label for="jobid">Job ID:</label>
+                    <input type="text" class="form-control" id="jobid" name="jobid" placeholder="e.g., 60a2b4e8b54c6a1e9c9c9f1e" required>
+                </div>
+                <button type="submit" class="btn btn-primary">View Matching Details</button>
+            </form>
+            <div class="mt-3">
+                <a href="/" class="btn btn-secondary">Back to Home</a>
+                <a href="/debug/jobposts" class="btn btn-secondary">View All Job Posts</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 def update_user_recommendations(user_id):
     """Update recommendations for a specific user and store in the database"""
@@ -944,6 +1166,101 @@ def get_recommendation_stats():
         'lastUpdated': stored_recommendations['timestamp'],
         'algorithm': stored_recommendations.get('algorithm', {'version': 'unknown'})
     })
+
+@app.route('/api/matching/<jobid>', methods=['GET'])
+def get_candidate_ranking_for_job(jobid):
+    """Get ranked list of candidates with matching scores for a specific job ID"""
+    try:
+        # Normalize job ID
+        normalized_job_id = normalize_id(jobid)
+        logging.debug(f"Received request for job ID: {normalized_job_id}")
+
+        # Find the job index in the jobposts DataFrame
+        job_idx = None
+        for idx, row in jobposts.iterrows():
+            if str(row['JobID']) == normalized_job_id:
+                job_idx = idx
+                break
+        
+        if job_idx is None:
+            logging.error(f"Job ID {normalized_job_id} not found in jobposts")
+            return jsonify({"error": f"Job ID {normalized_job_id} not found"}), 404
+
+        # Get similarity scores for this job against all candidates
+        similarity_scores = similarity_matrix[job_idx, :]
+        
+        # Get top candidates (default: top 10, adjustable via query param)
+        num_candidates = int(request.args.get('limit', 10))
+        top_candidate_indices = np.argsort(-similarity_scores)[:num_candidates]
+        
+        # Prepare ranked list of candidates
+        ranked_candidates = []
+        job_id_str = str(jobposts.iloc[job_idx]['JobID'])
+        
+        for candidate_idx in top_candidate_indices:
+            candidate = candidates.iloc[candidate_idx]
+            candidate_id_str = str(candidate['CandidateID'])
+            similarity_score = float(similarity_scores[candidate_idx])
+            
+            # Skip very low similarity scores
+            if similarity_score < 0.01:
+                continue
+            
+            # Get detailed matching information if available
+            match_detail = {}
+            if (job_id_str in detailed_matching_info and 
+                candidate_id_str in detailed_matching_info[job_id_str]):
+                match_detail = detailed_matching_info[job_id_str][candidate_id_str]
+            
+            # Construct candidate data
+            candidate_data = {
+                'candidateId': candidate_id_str,
+                'name': f"{candidate.get('firstName', '')} {candidate.get('lastName', '')}".strip() 
+                        if 'firstName' in candidate else candidate_id_str,
+                'similarity': similarity_score,
+                'skillScore': float(match_detail.get('skill_similarity', similarity_score * (1/3))),
+                'experienceScore': float(match_detail.get('experience_similarity', similarity_score * (1/3))),
+                'educationScore': float(match_detail.get('education_similarity', similarity_score * (1/3))),
+                'exactSkillMatches': match_detail.get('exact_skill_matches', []),
+                'semanticSkillMatches': [
+                    {'jobSkill': js, 'candidateSkill': cs} 
+                    for js, cs in match_detail.get('semantic_skill_matches', [])
+                ],
+                'experienceMatches': [
+                    word[0] for word in match_detail.get('experience_matching_words', [])[:20]
+                ],
+                'educationMatches': [
+                    word[0] for word in match_detail.get('education_matching_words', [])[:20]
+                ],
+                'semanticEducationMatches': [
+                    {'jobEducation': je, 'candidateEducation': ce} 
+                    for je, ce in match_detail.get('semantic_education_matches', [])
+                ],
+                'semanticExperienceMatches': [
+                    {'jobExperience': je, 'candidateExperience': ce} 
+                    for je, ce in match_detail.get('semantic_experience_matches', [])
+                ]
+            }
+            ranked_candidates.append(candidate_data)
+        
+        # Sort candidates by similarity score (descending)
+        ranked_candidates.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # Prepare response
+        response = {
+            'jobId': normalized_job_id,
+            'jobTitle': jobposts.iloc[job_idx]['JobTitle'] if 'JobTitle' in jobposts.columns else 'Unknown',
+            'candidates': ranked_candidates,
+            'totalCandidates': len(ranked_candidates),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logging.debug(f"Returning {len(ranked_candidates)} candidates for job {normalized_job_id}")
+        return jsonify(response), 200
+    
+    except Exception as e:
+        logging.error(f"Error processing job ID {jobid}: {str(e)}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)

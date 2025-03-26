@@ -235,6 +235,54 @@ Retrieves statistics about a candidate's recommendations and interactions.
     }
   }
   ```
+#### 5. Retrieve Candidate Matching for a Job
+
+This endpoint retrieves a ranked list of candidates based on their matching scores for a specific job ID.
+
+- **URL**: `/api/matching/<jobid>`
+- **Method**: GET
+- **Query Parameters**:
+  - `jobId` (required): The ID of the job
+- **Success Response**:
+  ```json
+  {
+    "jobId": "60a2b4e8b54c6a1e9c9c9f1e",
+    "jobTitle": "Senior Software Engineer",
+    "candidates": [
+      {
+        "candidateId": "60a2b4e8b54c6a1e9c9c9f1d",
+        "name": "John Doe",
+        "similarity": 0.85,
+        "skillScore": 0.42,
+        "experienceScore": 0.28,
+        "educationScore": 0.15,
+        "exactSkillMatches": ["Python", "JavaScript"],
+        "semanticSkillMatches": [{"jobSkill": "MongoDB", "candidateSkill": "NoSQL"}],
+        "experienceMatches": ["development", "software"],
+        "educationMatches": ["computer science"],
+        "semanticEducationMatches": [{"jobEducation": "bachelor", "candidateEducation": "bs computer science"}],
+        "semanticExperienceMatches": [{"jobExperience": "developer", "candidateExperience": "software developer"}]
+      },
+      {
+        "candidateId": "60a2b4e8b54c6a1e9c9c9f2a",
+        "name": "Jane Smith",
+        "similarity": 0.78,
+        "skillScore": 0.38,
+        "experienceScore": 0.25,
+        "educationScore": 0.15,
+        "exactSkillMatches": ["Python"],
+        "semanticSkillMatches": [{"jobSkill": "React", "candidateSkill": "JavaScript"}],
+        "experienceMatches": ["coding", "design"],
+        "educationMatches": ["engineering"],
+        "semanticEducationMatches": [],
+        "semanticExperienceMatches": []
+      }
+      // ... more candidates
+    ],
+    "totalCandidates": 5,
+    "timestamp": "2025-03-26T12:34:56.789Z"
+  }
+  ```
 
 ### Angular Integration Example
 
