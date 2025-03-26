@@ -362,6 +362,18 @@
                                             {% if details.experience_matching_words|length > 15 %}...{% endif %}
                                         </div>
                                         
+                                        {% if details.semantic_experience_matches %}
+                                        <h5>Semantic Experience Matches:</h5>
+                                        <div style="margin-bottom: 10px;">
+                                            {% for match in details.semantic_experience_matches[:10] %}
+                                                <div class="skill-tag skill-partial">
+                                                    {{ match[0] }} ≈ {{ match[1] }}
+                                                </div>
+                                            {% endfor %}
+                                            {% if details.semantic_experience_matches|length > 10 %}...{% endif %}
+                                        </div>
+                                        {% endif %}
+                                        
                                         <h5>Job Description Text:</h5>
                                         {% if 'JobDescription' in job and job['JobDescription'] %}
                                             {% set job_text = job['JobDescription'] %}
@@ -419,6 +431,18 @@
                                             {% endfor %}
                                             {% if details.education_matching_words|length > 15 %}...{% endif %}
                                         </div>
+                                        
+                                        {% if details.semantic_education_matches %}
+                                        <h5>Semantic Education Matches:</h5>
+                                        <div style="margin-bottom: 10px;">
+                                            {% for match in details.semantic_education_matches[:10] %}
+                                                <div class="skill-tag skill-partial">
+                                                    {{ match[0] }} ≈ {{ match[1] }}
+                                                </div>
+                                            {% endfor %}
+                                            {% if details.semantic_education_matches|length > 10 %}...{% endif %}
+                                        </div>
+                                        {% endif %}
                                         
                                         <h5>Job Description Text:</h5>
                                         {% if 'JobDescription' in job and job['JobDescription'] %}

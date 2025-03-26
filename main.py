@@ -8,6 +8,7 @@ import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
 import string
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -588,11 +589,57 @@ for job_idx, job in enumerate(jobposts.iterrows()):
         exp_matches = []
         if job_idx < len(experience_matching_words) and candidate_idx < len(experience_matching_words[job_idx]):
             exp_matches = experience_matching_words[job_idx][candidate_idx]
-        
+            
         # Get education matching words
         edu_matches = []
         if job_idx < len(education_matching_words) and candidate_idx < len(education_matching_words[job_idx]):
             edu_matches = education_matching_words[job_idx][candidate_idx]
+            
+        # Extract education terms for semantic matching
+        job_education = []
+        if 'Education' in job[1] and isinstance(job[1]['Education'], list):
+            job_education = [edu.lower() for edu in job[1]['Education'] if isinstance(edu, str)]
+        
+        candidate_education = []
+        if 'Education' in candidate[1] and isinstance(candidate[1]['Education'], list):
+            candidate_education = [edu.lower() for edu in candidate[1]['Education'] if isinstance(edu, str)]
+            
+        # Find semantic education matches
+        semantic_education_matches = []
+        for job_edu in job_education:
+            for candidate_edu in candidate_education:
+                if len(job_edu) > 3 and len(candidate_edu) > 3:
+                    # Check if terms share significant substring or are related
+                    if (job_edu in candidate_edu or candidate_edu in job_edu or 
+                        any(term in job_edu and term in candidate_edu for term in ["degree", "bachelor", "master", "phd", "diploma", "certificate"])):
+                        if (job_edu, candidate_edu) not in semantic_education_matches:
+                            semantic_education_matches.append((job_edu, candidate_edu))
+        
+        # Extract experience terms for semantic matching
+        job_experience = []
+        if 'experience_details' in job[1] and isinstance(job[1]['experience_details'], list):
+            job_experience = [exp.lower() for exp in job[1]['experience_details'] if isinstance(exp, str)]
+        elif 'JobDescription' in job[1] and isinstance(job[1]['JobDescription'], str):
+            # Extract experience-related terms from job description
+            job_experience = [term.lower() for term in job[1]['JobDescription'].split() 
+                             if any(exp_term in term.lower() for exp_term in ["develop", "manag", "lead", "architect", "engineer", "analys"])]
+            
+        candidate_experience = []
+        if 'experience_details' in candidate[1] and isinstance(candidate[1]['experience_details'], list):
+            candidate_experience = [exp.lower() for exp in candidate[1]['experience_details'] if isinstance(exp, str)]
+            
+        # Find semantic experience matches
+        semantic_experience_matches = []
+        experience_terms = ["develop", "manag", "lead", "direct", "head", "senior", "architect", "engineer", "design", "analyst"]
+        
+        for job_exp in job_experience:
+            for candidate_exp in candidate_experience:
+                if len(job_exp) > 3 and len(candidate_exp) > 3:
+                    # Check if terms share significant substring or contain common role keywords
+                    if (job_exp in candidate_exp or candidate_exp in job_exp or
+                        any(term in job_exp and term in candidate_exp for term in experience_terms)):
+                        if (job_exp, candidate_exp) not in semantic_experience_matches:
+                            semantic_experience_matches.append((job_exp, candidate_exp))
         
         # Gather raw text data
         job_text = job[1]['JobDescription'] if 'JobDescription' in job[1] and pd.notna(job[1]['JobDescription']) else ""
@@ -629,6 +676,8 @@ for job_idx, job in enumerate(jobposts.iterrows()):
             'semantic_skill_matches': semantic_skill_matches,
             'experience_matching_words': exp_matches,
             'education_matching_words': edu_matches,
+            'semantic_education_matches': semantic_education_matches,
+            'semantic_experience_matches': semantic_experience_matches,
             'job_text': job_text,
             'experience_text': experience_text,
             'education_text': education_text
@@ -686,3 +735,100 @@ with open('detailed_matching_info.pkl', 'wb') as f:
 
 logging.info("Data processing and model creation completed successfully")
 print("Data processing and model creation completed successfully")
+
+# Store recommendation data in MongoDB for faster access and analytics
+logging.info("Storing recommendation data in MongoDB...")
+
+# Create a collection for storing pre-calculated recommendations if it doesn't exist
+if 'jobRecommendations' not in db.list_collection_names():
+    db.create_collection('jobRecommendations')
+recommendations_collection = db['jobRecommendations']
+
+# Clear existing recommendation data to prevent duplicates
+recommendations_collection.delete_many({})
+
+# Store pre-calculated recommendations for each candidate
+stored_count = 0
+for candidate_idx, candidate in enumerate(candidates.iterrows()):
+    candidate_id = str(candidate[1]['CandidateID'])
+    
+    # Get top 5 job recommendations for this candidate
+    job_indices = np.argsort(-final_similarity[:, candidate_idx])[:5]
+    recommendations = []
+    
+    for job_idx in job_indices:
+        job = jobposts.iloc[job_idx]
+        job_id = str(job['JobID'])
+        similarity_score = float(final_similarity[job_idx, candidate_idx])
+        
+        # Skip very low similarity scores
+        if similarity_score < 0.01:
+            continue
+            
+        # Get detailed matching information if available
+        match_detail = {}
+        if job_id in detailed_matching_info and candidate_id in detailed_matching_info[job_id]:
+            match_detail = detailed_matching_info[job_id][candidate_id]
+        
+        # Format recommendation data for MongoDB storage
+        recommendation = {
+            'jobId': job_id,
+            'jobTitle': job['JobTitle'] if 'JobTitle' in job else '',
+            'similarity': similarity_score,
+            'skillScore': float(match_detail.get('skill_similarity', 0)),
+            'experienceScore': float(match_detail.get('experience_similarity', 0)),
+            'educationScore': float(match_detail.get('education_similarity', 0)),
+            'exactSkillMatches': match_detail.get('exact_skill_matches', []),
+            'semanticSkillMatches': [
+                {'jobSkill': js, 'candidateSkill': cs} 
+                for js, cs in match_detail.get('semantic_skill_matches', [])
+            ],
+            'semanticEducationMatches': [
+                {'jobEducation': je, 'candidateEducation': ce} 
+                for je, ce in match_detail.get('semantic_education_matches', [])
+            ],
+            'semanticExperienceMatches': [
+                {'jobExperience': je, 'candidateExperience': ce} 
+                for je, ce in match_detail.get('semantic_experience_matches', [])
+            ],
+            'experienceMatches': [
+                word[0] for word in match_detail.get('experience_matching_words', [])[:20]
+            ],
+            'educationMatches': [
+                word[0] for word in match_detail.get('education_matching_words', [])[:20]
+            ],
+            'interacted': False,
+            'applied': False,
+            'lastViewed': None
+        }
+        
+        recommendations.append(recommendation)
+    
+    # Only store if we have recommendations
+    if recommendations:
+        # Store in database with 24-hour expiration
+        recommendations_collection.update_one(
+            {'userId': candidate_id},
+            {
+                '$set': {
+                    'timestamp': datetime.now(),
+                    'recommendations': recommendations,
+                    'algorithm': {
+                        'version': '1.0',
+                        'weights': {'skills': 1/3, 'experience': 1/3, 'education': 1/3}
+                    }
+                }
+            },
+            upsert=True
+        )
+        stored_count += 1
+
+logging.info(f"Stored recommendations for {stored_count} candidates in MongoDB")
+logging.info("MongoDB storage completed successfully")
+
+# Also create indexes for faster querying
+recommendations_collection.create_index("userId")
+recommendations_collection.create_index([("timestamp", 1)], expireAfterSeconds=86400)  # 24 hour TTL
+
+logging.info("All data processing and storage completed successfully")
+print("All data processing and storage completed successfully")
