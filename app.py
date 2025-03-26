@@ -266,6 +266,8 @@ def recommend_jobs():
                     'semantic_skill_matches': [],
                     'experience_matching_words': [],
                     'education_matching_words': [],
+                    'semantic_education_matches': [],
+                    'semantic_experience_matches': [],
                     'job_text': job['JobDescription'] if 'JobDescription' in job else "",
                     'experience_text': experience_text,
                     'education_text': education_text
@@ -287,6 +289,10 @@ def recommend_jobs():
                     # Extract matching words
                     job_details['experience_matching_words'] = [word for word, score in detailed_info.get('experience_matching_words', [])]
                     job_details['education_matching_words'] = [word for word, score in detailed_info.get('education_matching_words', [])]
+                    
+                    # Extract semantic education and experience matches
+                    job_details['semantic_education_matches'] = detailed_info.get('semantic_education_matches', [])
+                    job_details['semantic_experience_matches'] = detailed_info.get('semantic_experience_matches', [])
                 else:
                     # Calculate on the fly if detailed info is not available
                     logging.info(f"Detailed matching info not found for job {job_id_str} and candidate {candidate_id_str}")
@@ -309,6 +315,10 @@ def recommend_jobs():
                         
                         job_details['experience_matching_words'] = list(job_desc_words.intersection(exp_words))
                         job_details['education_matching_words'] = list(job_desc_words.intersection(edu_words))
+                        
+                        # Simple fallback for semantic matches
+                        job_details['semantic_education_matches'] = []
+                        job_details['semantic_experience_matches'] = []
                 
                 # Store the complete details
                 matching_details.append(job_details)
@@ -762,6 +772,14 @@ def update_user_recommendations(user_id):
             'semanticSkillMatches': [
                 {'jobSkill': js, 'candidateSkill': cs} 
                 for js, cs in match_detail.get('semantic_skill_matches', [])
+            ],
+            'semanticEducationMatches': [
+                {'jobEducation': je, 'candidateEducation': ce} 
+                for je, ce in match_detail.get('semantic_education_matches', [])
+            ],
+            'semanticExperienceMatches': [
+                {'jobExperience': je, 'candidateExperience': ce} 
+                for je, ce in match_detail.get('semantic_experience_matches', [])
             ],
             'experienceMatches': [
                 word[0] for word in match_detail.get('experience_matching_words', [])[:20]
