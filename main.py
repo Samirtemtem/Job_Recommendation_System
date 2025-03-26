@@ -5,6 +5,9 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics.pairwise import cosine_similarity
 import pickle
 import logging
+from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+import string
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -226,18 +229,119 @@ skills_set = list(set(all_skills))
 
 logging.info(f"Found {len(skills_set)} unique skills")
 
+# Define semantic skill groups (skills that are semantically related)
+def create_semantic_skill_groups():
+    """
+    Create groups of semantically similar skills to improve matching.
+    
+    Returns:
+        dict: A dictionary mapping each skill to its semantic group
+    """
+    # Define groups of semantically similar skills
+    semantic_groups = {
+        'programming': [
+            'Python', 'JavaScript', 'Java', 'C++', 'C#', 'PHP', 'Ruby', 'Golang', 'Programming',
+            'Coding', 'Development', 'Software Development', 'Software Engineering'
+        ],
+        'web_development': [
+            'HTML', 'CSS', 'JavaScript', 'React', 'Angular', 'Vue', 'Node.js', 'Frontend', 
+            'Backend', 'Full Stack', 'Web Development', 'Web Design', 'UI/UX'
+        ],
+        'data_science': [
+            'Python', 'R', 'SQL', 'Data Analysis', 'Machine Learning', 'AI', 'Artificial Intelligence',
+            'Deep Learning', 'Data Science', 'Data Mining', 'Statistics', 'Data Visualization',
+            'Big Data', 'Data Engineering'
+        ],
+        'database': [
+            'SQL', 'MySQL', 'PostgreSQL', 'MongoDB', 'NoSQL', 'Database', 'Data Modeling',
+            'Oracle', 'SQL Server', 'Database Administration', 'Database Management'
+        ],
+        'cloud': [
+            'AWS', 'Azure', 'Google Cloud', 'Cloud Computing', 'Cloud Architecture',
+            'DevOps', 'Docker', 'Kubernetes', 'Containerization', 'Infrastructure'
+        ],
+        'project_management': [
+            'Project Management', 'Scrum', 'Agile', 'JIRA', 'Kanban', 'Leadership',
+            'Team Management', 'Product Management'
+        ]
+    }
+    
+    # Create a mapping from skill to group
+    skill_to_group = {}
+    for group, skills in semantic_groups.items():
+        for skill in skills:
+            skill_to_group[skill.lower()] = group
+    
+    return skill_to_group
+
+# Create semantic skill mapping
+skill_to_group = create_semantic_skill_groups()
+logging.info(f"Created semantic groups for {len(skill_to_group)} skills")
+
 def encode_features(df, feature_set, column_name):
+    """
+    Encode features considering both exact and semantic matches.
+    
+    Args:
+        df: DataFrame containing the data
+        feature_set: The set of features to encode against
+        column_name: The column containing the features to encode
+    
+    Returns:
+        np.array: Encoded feature vectors
+    """
     encoded_features = []
     for features in df[column_name]:
         if not isinstance(features, list):
             features = []
-        encoded = [1 if feature in features else 0 for feature in feature_set]
+        
+        # Convert features to lowercase for matching
+        features_lower = [f.lower() if isinstance(f, str) else "" for f in features]
+        
+        # Get semantic groups for the features
+        feature_groups = set()
+        for feature in features_lower:
+            if feature in skill_to_group:
+                feature_groups.add(skill_to_group[feature])
+        
+        # Create vector with both exact and semantic matches
+        encoded = []
+        for feature in feature_set:
+            feature_lower = feature.lower() if isinstance(feature, str) else ""
+            
+            # Check for exact match
+            exact_match = feature_lower in features_lower
+            
+            # Check for semantic match
+            semantic_match = False
+            if feature_lower in skill_to_group:
+                semantic_match = skill_to_group[feature_lower] in feature_groups
+            
+            # Use 1 for exact match, 0.5 for semantic match only
+            if exact_match:
+                encoded.append(1.0)
+            elif semantic_match:
+                encoded.append(0.5)  # Half weight for semantic match
+            else:
+                encoded.append(0.0)
+                
         encoded_features.append(encoded)
+    
     return np.array(encoded_features)
 
-logging.info("Encoding skills...")
+logging.info("Encoding skills with semantic matching...")
 jobposts_skills_encoded = encode_features(jobposts, skills_set, 'Skills')
 candidates_skills_encoded = encode_features(candidates, skills_set, 'Skills')
+
+# Log information about semantic matching
+total_semantic_matches = np.sum((jobposts_skills_encoded > 0) & (jobposts_skills_encoded < 1))
+logging.info(f"Added {total_semantic_matches} semantic matches across all job posts")
+
+nonzero_jobposts = np.sum(np.any(jobposts_skills_encoded > 0, axis=1))
+logging.info(f"Job posts with at least one skill match (exact or semantic): {nonzero_jobposts} out of {jobposts_skills_encoded.shape[0]}")
+
+nonzero_candidates = np.sum(np.any(candidates_skills_encoded > 0, axis=1))
+logging.info(f"Candidates with at least one skill match (exact or semantic): {nonzero_candidates} out of {candidates_skills_encoded.shape[0]}")
 
 # Create feature vectors combining categorical and skills data
 feature_columns = []
@@ -330,13 +434,241 @@ if similarity_matrix.size > 0:
         sample_size = min(5, similarity_matrix.shape[0], similarity_matrix.shape[1])
         logging.info(f"Sample of similarity matrix (5x5 or smaller):\n{similarity_matrix[:sample_size, :sample_size]}")
 
+# Now add experience and education description similarity (50% of the score)
+logging.info("Calculating experience and education description similarity...")
+
+def preprocess_text(text):
+    """Clean and preprocess text for better similarity matching."""
+    if not isinstance(text, str):
+        return ""
+    
+    # Convert to lowercase and remove punctuation
+    text = text.lower()
+    text = re.sub(f'[{string.punctuation}]', ' ', text)
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+# Function to calculate text similarity between job description and candidate text
+def calculate_text_similarity(job_descriptions, candidate_texts):
+    """
+    Calculate text similarity between job descriptions and candidate texts.
+    
+    Args:
+        job_descriptions: List of job description texts
+        candidate_texts: List of candidate text descriptions (experiences/education)
+        
+    Returns:
+        np.array: Matrix of similarity scores
+    """
+    # Handle empty descriptions
+    job_descriptions = [preprocess_text(desc) if desc else "" for desc in job_descriptions]
+    candidate_texts = [preprocess_text(text) if text else "" for text in candidate_texts]
+    
+    # If all texts are empty, return zeros
+    if all(not text for text in job_descriptions) or all(not text for text in candidate_texts):
+        return np.zeros((len(job_descriptions), len(candidate_texts))), [], []
+    
+    # Vectorize texts using TF-IDF
+    vectorizer = TfidfVectorizer(stop_words='english')
+    
+    # Combine all texts for fitting
+    all_texts = job_descriptions + candidate_texts
+    
+    # If texts are empty, return zeros
+    if not any(all_texts):
+        return np.zeros((len(job_descriptions), len(candidate_texts))), [], []
+    
+    try:
+        tfidf_matrix = vectorizer.fit_transform(all_texts)
+        
+        # Get feature names (words) from the vectorizer
+        feature_names = vectorizer.get_feature_names_out()
+        
+        # Split matrices for jobs and candidates
+        job_tfidf = tfidf_matrix[:len(job_descriptions)]
+        candidate_tfidf = tfidf_matrix[len(job_descriptions):]
+        
+        # Calculate cosine similarity
+        similarity = cosine_similarity(job_tfidf, candidate_tfidf)
+        
+        # For each job-candidate pair, find the top matching words
+        matching_words = []
+        for i in range(len(job_descriptions)):
+            job_words = job_tfidf[i].toarray()[0]
+            job_matches = []
+            
+            for j in range(len(candidate_texts)):
+                candidate_words = candidate_tfidf[j].toarray()[0]
+                # Find words that appear in both job and candidate text
+                common_word_indices = np.where((job_words > 0) & (candidate_words > 0))[0]
+                # Get the words and their TF-IDF scores in the job description
+                words_with_scores = [(feature_names[idx], job_words[idx]) 
+                                    for idx in common_word_indices]
+                # Sort by importance (TF-IDF score)
+                words_with_scores.sort(key=lambda x: x[1], reverse=True)
+                job_matches.append(words_with_scores)
+            
+            matching_words.append(job_matches)
+        
+        # Extract raw text similarity information for storing
+        raw_text_info = [
+            {
+                'job_text': job_desc,
+                'processed_job_text': preprocess_text(job_desc)
+            }
+            for job_desc in job_descriptions
+        ]
+        
+        return similarity, matching_words, raw_text_info
+    except Exception as e:
+        logging.error(f"Error calculating text similarity: {e}")
+        return np.zeros((len(job_descriptions), len(candidate_texts))), [], []
+
+# Extract descriptions
+job_descriptions = jobposts['JobDescription'].fillna('').tolist()
+
+# Prepare experience descriptions for candidates
+candidate_experience_texts = []
+for _, candidate in candidates.iterrows():
+    # Combine all experience descriptions
+    exp_text = ""
+    if 'experience_details' in candidate and isinstance(candidate['experience_details'], list):
+        exp_text = " ".join([str(exp) for exp in candidate['experience_details']])
+    candidate_experience_texts.append(exp_text)
+
+# Prepare education descriptions for candidates
+candidate_education_texts = []
+for _, candidate in candidates.iterrows():
+    # Combine all education descriptions
+    edu_text = ""
+    if 'Education' in candidate and isinstance(candidate['Education'], list):
+        edu_text = " ".join([str(edu) for edu in candidate['Education']])
+    candidate_education_texts.append(edu_text)
+
+# Calculate description similarities with detailed word matching
+experience_similarity, experience_matching_words, exp_raw_info = calculate_text_similarity(
+    job_descriptions, candidate_experience_texts
+)
+education_similarity, education_matching_words, edu_raw_info = calculate_text_similarity(
+    job_descriptions, candidate_education_texts
+)
+
+# Create a detailed matching information dictionary for each job-candidate pair
+detailed_matching_info = {}
+for job_idx, job in enumerate(jobposts.iterrows()):
+    job_id = str(job[1]['JobID'])
+    detailed_matching_info[job_id] = {}
+    
+    for candidate_idx, candidate in enumerate(candidates.iterrows()):
+        candidate_id = str(candidate[1]['CandidateID'])
+        
+        # Extract job and candidate skills for comparison
+        job_skills = job[1]['Skills'] if isinstance(job[1]['Skills'], list) else []
+        candidate_skills = candidate[1]['Skills'] if isinstance(candidate[1]['Skills'], list) else []
+        
+        # Find exact skill matches
+        exact_skill_matches = [skill for skill in job_skills if skill in candidate_skills]
+        
+        # Find semantic skill matches
+        semantic_skill_matches = []
+        
+        # For simplicity, we'll consider skills that share at least 3 consecutive characters as potential semantic matches
+        for job_skill in job_skills:
+            if job_skill in exact_skill_matches:
+                continue  # Skip exact matches
+                
+            for candidate_skill in candidate_skills:
+                if len(job_skill) > 3 and len(candidate_skill) > 3:
+                    if job_skill.lower() in candidate_skill.lower() or candidate_skill.lower() in job_skill.lower():
+                        if (job_skill, candidate_skill) not in semantic_skill_matches:
+                            semantic_skill_matches.append((job_skill, candidate_skill))
+        
+        # Get experience matching words
+        exp_matches = []
+        if job_idx < len(experience_matching_words) and candidate_idx < len(experience_matching_words[job_idx]):
+            exp_matches = experience_matching_words[job_idx][candidate_idx]
+        
+        # Get education matching words
+        edu_matches = []
+        if job_idx < len(education_matching_words) and candidate_idx < len(education_matching_words[job_idx]):
+            edu_matches = education_matching_words[job_idx][candidate_idx]
+        
+        # Gather raw text data
+        job_text = job[1]['JobDescription'] if 'JobDescription' in job[1] and pd.notna(job[1]['JobDescription']) else ""
+        experience_text = candidate_experience_texts[candidate_idx] if candidate_idx < len(candidate_experience_texts) else ""
+        education_text = candidate_education_texts[candidate_idx] if candidate_idx < len(candidate_education_texts) else ""
+        
+        # Calculate individual similarity components (if available)
+        skill_similarity = 0.0
+        if job_idx < len(jobposts_combined) and candidate_idx < len(candidates_combined):
+            # Calculate skill-only similarity
+            if jobposts_skills_encoded.shape[1] > 0:
+                job_skills_vector = jobposts_skills_encoded[job_idx]
+                candidate_skills_vector = candidates_skills_encoded[candidate_idx]
+                if np.any(job_skills_vector) and np.any(candidate_skills_vector):
+                    skill_similarity_raw = cosine_similarity([job_skills_vector], [candidate_skills_vector])[0][0]
+                    skill_similarity = skill_similarity_raw * (1/3)  # 33.3% weight (1/3)
+                
+        # Get the experience and education similarities
+        exp_similarity = 0.0
+        if job_idx < experience_similarity.shape[0] and candidate_idx < experience_similarity.shape[1]:
+            exp_similarity = experience_similarity[job_idx, candidate_idx] * (1/3)  # 33.3% weight (1/3)
+            
+        edu_similarity = 0.0
+        if job_idx < education_similarity.shape[0] and candidate_idx < education_similarity.shape[1]:
+            edu_similarity = education_similarity[job_idx, candidate_idx] * (1/3)  # 33.3% weight (1/3)
+        
+        # Store all the detailed matching information
+        detailed_matching_info[job_id][candidate_id] = {
+            'skill_similarity': skill_similarity,
+            'experience_similarity': exp_similarity,
+            'education_similarity': edu_similarity,
+            'total_similarity': skill_similarity + exp_similarity + edu_similarity,
+            'exact_skill_matches': exact_skill_matches,
+            'semantic_skill_matches': semantic_skill_matches,
+            'experience_matching_words': exp_matches,
+            'education_matching_words': edu_matches,
+            'job_text': job_text,
+            'experience_text': experience_text,
+            'education_text': education_text
+        }
+
+# Combine all similarities with equal weights
+# 33.3% skills, 33.3% experience, 33.3% education
+logging.info("Combining similarities with equal weights: 33.3% skills, 33.3% experience, 33.3% education")
+
+# Normalize the original skill-based similarity to be 1/3 (33.3%)
+skill_similarity = similarity_matrix * (1/3)
+
+# Add experience and education similarities
+final_similarity = skill_similarity.copy()
+for i in range(len(jobposts)):
+    for j in range(len(candidates)):
+        # Add experience similarity (33.3%)
+        if i < experience_similarity.shape[0] and j < experience_similarity.shape[1]:
+            final_similarity[i, j] += experience_similarity[i, j] * (1/3)
+        
+        # Add education similarity (33.3%)
+        if i < education_similarity.shape[0] and j < education_similarity.shape[1]:
+            final_similarity[i, j] += education_similarity[i, j] * (1/3)
+
+# Print debug information for the final similarity matrix
+logging.info(f"Final similarity matrix shape: {final_similarity.shape}")
+logging.info(f"Final min similarity: {np.min(final_similarity)}, max: {np.max(final_similarity)}")
+logging.info(f"Final average similarity: {np.mean(final_similarity)}")
+
+# Ensure no values exceed 1.0
+final_similarity = np.clip(final_similarity, 0, 1)
+
+# Use final_similarity instead of the original similarity_matrix for saving
 logging.info("Saving data to pickle files...")
 # Save similarity matrix and label encoders to pickle files
 with open('similarity_matrix.pkl', 'wb') as f:
-    pickle.dump(similarity_matrix, f)
+    pickle.dump(final_similarity, f)
     
 with open('candidate_similarity_matrix.pkl', 'wb') as f:
-    pickle.dump(similarity_matrix.T, f)
+    pickle.dump(final_similarity.T, f)
 
 with open('label_encoders.pkl', 'wb') as f:
     pickle.dump(label_encoders, f)
@@ -347,6 +679,10 @@ with open('jobposts.pkl', 'wb') as f:
 
 with open('candidates.pkl', 'wb') as f:
     pickle.dump(candidates, f)
+
+# Save the detailed matching information for use in the template
+with open('detailed_matching_info.pkl', 'wb') as f:
+    pickle.dump(detailed_matching_info, f)
 
 logging.info("Data processing and model creation completed successfully")
 print("Data processing and model creation completed successfully")
