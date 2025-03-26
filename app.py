@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, render_template, jsonify, session, redirect, url_for
 import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -7,8 +7,14 @@ from pymongo import MongoClient
 import logging
 import re
 from bson import ObjectId
+import os
+from datetime import datetime, timedelta
+from flask_cors import CORS
+import json
 
 app = Flask(__name__)
+app.secret_key = 'job_recommendation_system_secret_key'  # Required for session
+CORS(app)  # Enable CORS for all routes
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,6 +22,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 # MongoDB setup
 client = MongoClient('mongodb+srv://root:root@cluster0.wa1te.mongodb.net/recruitpro?retryWrites=true&w=majority')
 db = client['recruitpro']  # Replace with your actual database name if different
+recommendations_collection = db['jobRecommendations']  # New collection for recommendations
 
 # Collections
 users_collection = db['users']
@@ -44,9 +51,27 @@ try:
 
     with open('candidates.pkl', 'rb') as f:
         candidates = pickle.load(f)
+    
+    # Load the detailed matching information
+    detailed_matching_info = {}
+    try:
+        with open('detailed_matching_info.pkl', 'rb') as f:
+            detailed_matching_info = pickle.load(f)
+        logging.info("Loaded detailed matching information from pickle file")
+    except Exception as e:
+        logging.warning(f"Could not load detailed matching information: {e}")
+        logging.warning("Will calculate matching information on the fly")
         
     logging.info("Successfully loaded data from pickle files")
     logging.info(f"Loaded {len(candidates)} candidates and {len(jobposts)} job posts")
+    
+    # Extract all unique skills for semantic matching
+    all_skills = []
+    for skills_list in candidates['Skills'].tolist() + jobposts['Skills'].tolist():
+        if isinstance(skills_list, list):
+            all_skills.extend(skills_list)
+    all_skills = list(set(all_skills))
+    logging.info(f"Extracted {len(all_skills)} unique skills from data")
     
     # Debug log of first few candidates and their IDs
     if not candidates.empty:
@@ -62,6 +87,8 @@ except Exception as e:
     logging.error(f"Error loading data from pickle files: {e}")
     # If pickle files aren't available, we could reload from MongoDB here
     # This is a fallback and would require reimplementing the logic from main.py
+    all_skills = []
+    detailed_matching_info = {}
 
 # Helper function to normalize ID format
 def normalize_id(id_value):
@@ -182,10 +209,123 @@ def recommend_jobs():
         logging.debug("Recommended jobs: \n%s", recommended_jobs)
         logging.debug("Similar candidates: \n%s", similar_candidates)
         
+        # Find the actual candidate data for additional processing
+        candidate_idx = None
+        for idx, row in candidates.iterrows():
+            if str(row['CandidateID']) == str(candidate_id):
+                candidate_idx = idx
+                break
+        
+        # If we found the candidate, prepare detailed match information
+        if candidate_idx is not None:
+            candidate_data = candidates.iloc[candidate_idx]
+            candidate_id_str = str(candidate_data['CandidateID'])
+            
+            # Store candidate skills for matching in the template
+            candidate_skills = candidate_data['Skills'] if isinstance(candidate_data['Skills'], list) else []
+            
+            # Store experience and education text
+            experience_text = ""
+            if 'experience_details' in candidate_data and isinstance(candidate_data['experience_details'], list):
+                experience_text = " ".join([str(exp) for exp in candidate_data['experience_details']])
+            
+            education_text = ""
+            if 'Education' in candidate_data and isinstance(candidate_data['Education'], list):
+                education_text = " ".join([str(edu) for edu in candidate_data['Education']])
+            
+            # Create semantic skills list
+            candidate_semantic_skills = []
+            for skill in candidate_skills:
+                    if not isinstance(skill, str):
+                        continue
+                    skill_lower = skill.lower()
+                    for s in all_skills:
+                        if (len(s) > 3 and (s.lower() in skill_lower or skill_lower in s.lower()) and 
+                            s not in candidate_skills and s not in candidate_semantic_skills):
+                            candidate_semantic_skills.append(s)
+            
+            # Store these in the session for the template
+            session['candidate_id'] = candidate_id_str
+            session['candidate_skills'] = candidate_skills
+            session['candidate_semantic_skills'] = candidate_semantic_skills
+            session['experience_text'] = experience_text
+            session['education_text'] = education_text
+            
+            # Prepare detailed match information for each job
+            matching_details = []
+            for i, job in recommended_jobs.iterrows():
+                job_id_str = str(job['JobID'])
+                job_details = {
+                    'job_id': job_id_str,
+                    'job_title': job['JobTitle'],
+                    'skills_score': 0.0,
+                    'experience_score': 0.0,
+                    'education_score': 0.0,
+                    'total_score': job['Similarity'],
+                    'exact_skill_matches': [],
+                    'semantic_skill_matches': [],
+                    'experience_matching_words': [],
+                    'education_matching_words': [],
+                    'job_text': job['JobDescription'] if 'JobDescription' in job else "",
+                    'experience_text': experience_text,
+                    'education_text': education_text
+                }
+                
+                # If we have detailed matching info from the pickle file, use it
+                if job_id_str in detailed_matching_info and candidate_id_str in detailed_matching_info[job_id_str]:
+                    detailed_info = detailed_matching_info[job_id_str][candidate_id_str]
+                    
+                    # Extract component scores
+                    job_details['skills_score'] = detailed_info.get('skill_similarity', 0.0)
+                    job_details['experience_score'] = detailed_info.get('experience_similarity', 0.0)
+                    job_details['education_score'] = detailed_info.get('education_similarity', 0.0)
+                    
+                    # Extract matched skills
+                    job_details['exact_skill_matches'] = detailed_info.get('exact_skill_matches', [])
+                    job_details['semantic_skill_matches'] = detailed_info.get('semantic_skill_matches', [])
+                    
+                    # Extract matching words
+                    job_details['experience_matching_words'] = [word for word, score in detailed_info.get('experience_matching_words', [])]
+                    job_details['education_matching_words'] = [word for word, score in detailed_info.get('education_matching_words', [])]
+                else:
+                    # Calculate on the fly if detailed info is not available
+                    logging.info(f"Detailed matching info not found for job {job_id_str} and candidate {candidate_id_str}")
+                    
+                    # Fallback: calculate scores
+                    job_details['skills_score'] = job['Similarity'] * 0.5  # Estimate 50% from skills
+                    job_details['experience_score'] = job['Similarity'] * 0.3  # Estimate 30% from experience
+                    job_details['education_score'] = job['Similarity'] * 0.2  # Estimate 20% from education
+                    
+                    # Identify exact skill matches
+                    job_skills = job['Skills'] if isinstance(job['Skills'], list) else []
+                    job_details['exact_skill_matches'] = [skill for skill in job_skills if skill in candidate_skills]
+                    
+                    # Simple matching word extraction (less accurate than in main.py)
+                    if 'JobDescription' in job and pd.notna(job['JobDescription']):
+                        # Extract experience matching words
+                        job_desc_words = set(re.findall(r'\b\w{4,}\b', job['JobDescription'].lower()))
+                        exp_words = set(re.findall(r'\b\w{4,}\b', experience_text.lower()))
+                        edu_words = set(re.findall(r'\b\w{4,}\b', education_text.lower()))
+                        
+                        job_details['experience_matching_words'] = list(job_desc_words.intersection(exp_words))
+                        job_details['education_matching_words'] = list(job_desc_words.intersection(edu_words))
+                
+                # Store the complete details
+                matching_details.append(job_details)
+                
+                # Update the DataFrame with component scores
+                recommended_jobs.at[i, 'SkillsScore'] = job_details['skills_score']
+                recommended_jobs.at[i, 'ExperienceScore'] = job_details['experience_score']
+                recommended_jobs.at[i, 'EducationScore'] = job_details['education_score']
+            
+            # Store the matching details in the session for the template
+            session['matching_details'] = matching_details
+        
         return render_template(
             'recommendations.html', 
             jobs=recommended_jobs, 
-            candidates=similar_candidates
+            candidates=similar_candidates,
+            matching_details=session.get('matching_details', [])
         )
     except Exception as e:
         logging.error(f"Error generating recommendations: {e}")
@@ -586,6 +726,206 @@ def debug_skill_analysis():
         return html
     except Exception as e:
         return f"Error analyzing skills: {str(e)}"
+
+def update_user_recommendations(user_id):
+    """Update recommendations for a specific user and store in the database"""
+    # Find the candidate in the dataset
+    candidate_idx, candidate_data = find_candidate_by_id(user_id, candidates)
+    
+    if candidate_idx is None:
+        return {"error": f"Candidate with ID {user_id} not found"}, 404
+    
+    # Calculate recommendations
+    recommended_jobs, similar_candidates = hybrid_recommendation(
+        user_id, candidates, jobposts, similarity_matrix, candidate_similarity_matrix
+    )
+    
+    # Format recommendations for storage
+    recommendations = []
+    for _, job in recommended_jobs.iterrows():
+        job_id = str(job['JobID'])
+        match_detail = {}
+        
+        # Get detailed matching information if available
+        if job_id in detailed_matching_info and user_id in detailed_matching_info[job_id]:
+            match_detail = detailed_matching_info[job_id][user_id]
+        
+        # Convert numpy types to Python native types for MongoDB
+        recommendations.append({
+            'jobId': job_id,
+            'jobTitle': job['JobTitle'] if 'JobTitle' in job else '',
+            'similarity': float(job['Similarity']),
+            'skillScore': float(match_detail.get('skill_similarity', 0)),
+            'experienceScore': float(match_detail.get('experience_similarity', 0)),
+            'educationScore': float(match_detail.get('education_similarity', 0)),
+            'exactSkillMatches': match_detail.get('exact_skill_matches', []),
+            'semanticSkillMatches': [
+                {'jobSkill': js, 'candidateSkill': cs} 
+                for js, cs in match_detail.get('semantic_skill_matches', [])
+            ],
+            'experienceMatches': [
+                word[0] for word in match_detail.get('experience_matching_words', [])[:20]
+            ],
+            'educationMatches': [
+                word[0] for word in match_detail.get('education_matching_words', [])[:20]
+            ],
+            'interacted': False,
+            'applied': False,
+            'lastViewed': None
+        })
+    
+    # Store in database
+    recommendations_collection.update_one(
+        {'userId': user_id},
+        {
+            '$set': {
+                'timestamp': datetime.now(),
+                'recommendations': recommendations,
+                'algorithm': {
+                    'version': '1.0',
+                    'weights': {'skills': 1/3, 'experience': 1/3, 'education': 1/3}
+                }
+            }
+        },
+        upsert=True
+    )
+    
+    return {
+        'jobs': recommendations,
+        'timestamp': datetime.now()
+    }
+
+# REST API Endpoints for Job Recommendations
+
+@app.route('/api/recommendations/jobs', methods=['GET'])
+def get_job_recommendations_api():
+    """Get job recommendations for a user from the database or calculate new ones"""
+    user_id = request.args.get('candidateId')
+    
+    if not user_id:
+        return jsonify({"error": "candidateId parameter is required"}), 400
+    
+    # First try to get from database
+    stored_recommendations = recommendations_collection.find_one({'userId': user_id})
+    
+    # If recommendations exist and are fresh enough (< 24 hours)
+    if stored_recommendations and (datetime.now() - stored_recommendations['timestamp']).total_seconds() < 86400:
+        recommendations = stored_recommendations['recommendations']
+        
+        # Update interaction tracking for viewed recommendations
+        recommendations_collection.update_many(
+            {'userId': user_id},
+            {'$set': {'lastViewed': datetime.now()}}
+        )
+        
+        return jsonify({
+            'jobs': recommendations,
+            'source': 'database',
+            'lastUpdated': stored_recommendations['timestamp']
+        })
+    
+    # Otherwise calculate new recommendations and store them
+    result = update_user_recommendations(user_id)
+    
+    if isinstance(result, tuple) and len(result) == 2 and 'error' in result[0]:
+        return jsonify(result[0]), result[1]
+    
+    return jsonify({
+        'jobs': result['jobs'],
+        'source': 'fresh_calculation',
+        'lastUpdated': result['timestamp']
+    })
+
+@app.route('/api/recommendations/refresh', methods=['POST'])
+def refresh_recommendations_api():
+    """Force refresh recommendations for a user"""
+    data = request.get_json()
+    user_id = data.get('candidateId')
+    
+    if not user_id:
+        return jsonify({"error": "candidateId parameter is required"}), 400
+    
+    result = update_user_recommendations(user_id)
+    
+    if isinstance(result, tuple) and len(result) == 2 and 'error' in result[0]:
+        return jsonify(result[0]), result[1]
+    
+    return jsonify({
+        'message': 'Recommendations refreshed successfully',
+        'timestamp': result['timestamp'],
+        'count': len(result['jobs'])
+    })
+
+@app.route('/api/recommendations/interaction', methods=['POST'])
+def track_recommendation_interaction():
+    """Track user interaction with recommendations"""
+    data = request.get_json()
+    user_id = data.get('candidateId')
+    job_id = data.get('jobId')
+    interaction_type = data.get('type')  # 'view', 'click', 'apply'
+    
+    if not user_id or not job_id or not interaction_type:
+        return jsonify({"error": "candidateId, jobId and type parameters are required"}), 400
+    
+    # Default updates based on interaction type
+    update = {'recommendations.$.lastViewed': datetime.now()}
+    
+    if interaction_type == 'view' or interaction_type == 'click':
+        update['recommendations.$.interacted'] = True
+    elif interaction_type == 'apply':
+        update['recommendations.$.applied'] = True
+        update['recommendations.$.interacted'] = True
+    
+    # Update the specific job recommendation
+    result = recommendations_collection.update_one(
+        {
+            'userId': user_id,
+            'recommendations.jobId': job_id
+        },
+        {'$set': update}
+    )
+    
+    if result.matched_count == 0:
+        return jsonify({"error": "Recommendation not found"}), 404
+    
+    return jsonify({
+        'success': True,
+        'message': f'Interaction of type {interaction_type} recorded successfully'
+    })
+
+@app.route('/api/recommendations/stats', methods=['GET'])
+def get_recommendation_stats():
+    """Get statistics about recommendations"""
+    user_id = request.args.get('candidateId')
+    
+    if not user_id:
+        return jsonify({"error": "candidateId parameter is required"}), 400
+    
+    stored_recommendations = recommendations_collection.find_one({'userId': user_id})
+    
+    if not stored_recommendations:
+        return jsonify({
+            'hasRecommendations': False,
+            'message': 'No recommendations found for this user'
+        })
+    
+    recommendations = stored_recommendations['recommendations']
+    
+    # Calculate stats
+    total_count = len(recommendations)
+    interacted_count = sum(1 for r in recommendations if r.get('interacted', False))
+    applied_count = sum(1 for r in recommendations if r.get('applied', False))
+    avg_similarity = sum(r.get('similarity', 0) for r in recommendations) / total_count if total_count > 0 else 0
+    
+    return jsonify({
+        'hasRecommendations': True,
+        'totalCount': total_count,
+        'interactedCount': interacted_count,
+        'appliedCount': applied_count,
+        'averageSimilarity': avg_similarity,
+        'lastUpdated': stored_recommendations['timestamp'],
+        'algorithm': stored_recommendations.get('algorithm', {'version': 'unknown'})
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)
